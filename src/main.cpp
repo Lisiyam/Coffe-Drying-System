@@ -43,7 +43,7 @@ const char *NVS_NAMESPACE = "cordy_cfg";
 
 // Variabel runtime konfigurasi ThingSpeak (dibaca dari NVS saat boot)
 char cfg_ts_channel_id[16]  = "0";
-char cfg_ts_api_key[24]     = "";
+char cfg_ts_api_key[33]     = "";
 
 Preferences preferences;
 WiFiManager wifiManager;
@@ -51,7 +51,7 @@ WiFiClient  wifiClient;
 
 // Custom parameter WiFiManager untuk ThingSpeak
 WiFiManagerParameter param_ts_channel_id("ts_ch_id",  "ThingSpeak Channel ID",  cfg_ts_channel_id, 15);
-WiFiManagerParameter param_ts_api_key   ("ts_api_key","ThingSpeak Write API Key",cfg_ts_api_key,    23);
+WiFiManagerParameter param_ts_api_key   ("ts_api_key","ThingSpeak Write API Key",cfg_ts_api_key,    32);
 
 const unsigned long THINGSPEAK_INTERVAL_MS = 20000;
 unsigned long lastThingSpeakSendMs = 0;
@@ -160,6 +160,10 @@ unsigned long lastSerialPrintMs = 0;
 // ============================================================
 void updateButton();
 void tareScale();
+void stopHeater();
+void updateIndicators();
+void openConfigPortal();
+void onWiFiEvent(WiFiEvent_t event);
 
 // ============================================================
 // NVS — SIMPAN & BACA KONFIGURASI
@@ -213,6 +217,9 @@ void saveConfigToNVS() {
  */
 void onWiFiManagerSave() {
   saveConfigToNVS();
+  // Re-init ThingSpeak supaya pakai config terbaru dari portal
+  ThingSpeak.begin(wifiClient);
+  Serial.println("ThingSpeak di-reinit dengan konfigurasi baru.");
 }
 
 /**
