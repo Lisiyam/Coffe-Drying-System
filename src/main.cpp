@@ -30,7 +30,7 @@ const int WIFI_PORTAL_TIMEOUT_S = 180;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 10000UL;
 
 // Jika reconnect terus gagal selama X menit, baru buka portal
-const unsigned long WIFI_FAIL_PORTAL_MS = 5UL * 60UL * 1000UL; // 5 menit
+const unsigned long WIFI_FAIL_PORTAL_MS = 3UL * 60UL * 1000UL; // 3 menit
 
 // State WiFi internal
 volatile bool wifiConnected       = false; // diupdate oleh event handler
@@ -65,19 +65,24 @@ float currentTemperatureC = NAN;
 float currentHumidity     = NAN;
 
 // ================= PID =================
-const double TEMPERATURE_SETPOINT_C = 38.0;
-double kp = 35.0;
-double ki = 0.50;
-double kd = 0.0;
+const float TEMPERATURE_SETPOINT_C = 39.0;
+float kp = 20.0;
+float ki = 0.55;
+float kd = 0.0;
+const float PID_SCALE_FACTOR    = 2.6;   // skala output PID ke PWM
+const float PID_LPF_ALPHA       = 0.2;   // low-pass filter suhu (0.2 raw + 0.8 prev)
+const float PID_INTEGRAL_DECAY  = 0.999; // integral decay saat error < 0.5
+const float PID_DEADBAND_PWM    = 5.0;   // PWM di bawah ini dibulatkan ke 0
 
-double pidIntegral    = 0.0;
-double previousError  = 0.0;
+float pidIntegral     = 0.0;
+float previousError   = 0.0;
+float filteredTempPid = NAN;   // suhu terfilter khusus PID (LPF)
 unsigned long previousPidMs = 0;
 int heaterDuty = 0;
 
-const int PWM_FREQ         = 1000;
-const int PWM_RESOLUTION   = 8;
-const int PWM_MAX_DUTY     = 255;
+const int PWM_FREQ           = 10;   // 10 Hz — sesuai tuning
+const int PWM_RESOLUTION     = 8;
+const int PWM_MAX_DUTY       = 255;
 const int HEATER_PWM_CHANNEL = 0;
 
 // ================= LOAD CELL =================
@@ -142,6 +147,16 @@ enum DrynessStatus {
 SystemState   systemState  = STATE_IDLE;
 DrynessStatus drynessStatus = DRYNESS_UNKNOWN;
 
+// ================= FAN =================
+const byte FAN_PIN = 25;
+
+// Siklus fan: nyala 10 menit setiap 1 jam (hanya saat STATE_DRYING)
+const unsigned long FAN_ON_DURATION_MS  = 10UL * 60UL * 1000UL;  // 10 menit
+const unsigned long FAN_OFF_DURATION_MS = 60UL * 60UL * 1000UL;  // 60 menit 
+
+bool fanActive            = false; // true = fan sedang nyala
+unsigned long fanCycleStartMs = 0; // kapan siklus (nyala atau mati) dimulai
+
 // ================= BUTTON =================
 const unsigned long BUTTON_DEBOUNCE_MS   = 50;
 const unsigned long BUTTON_HOLD_RESET_MS = 3000;
@@ -164,6 +179,8 @@ void stopHeater();
 void updateIndicators();
 void openConfigPortal();
 void onWiFiEvent(WiFiEvent_t event);
+void stopFan();
+void updateFan();
 
 // ============================================================
 // NVS — SIMPAN & BACA KONFIGURASI
@@ -454,9 +471,10 @@ void stopHeater() { writeHeaterPwm(0); }
 // ============================================================
 
 void resetPid() {
-  pidIntegral   = 0.0;
-  previousError = 0.0;
-  previousPidMs = millis();
+  pidIntegral     = 0.0;
+  previousError   = 0.0;
+  filteredTempPid = NAN;
+  previousPidMs   = millis();
 }
 
 // ============================================================
@@ -482,6 +500,8 @@ void setSystemState(SystemState nextState) {
   }
 
   stopHeater();
+  stopFan();
+  fanCycleStartMs = 0;
   resetPid();
   Serial.print("Sistem masuk state: ");
   Serial.println(systemStateToText(systemState));
@@ -697,17 +717,107 @@ void updateDhtReading() {
 
 void updatePidHeater() {
   if (systemState != STATE_DRYING || isnan(currentTemperatureC)) { stopHeater(); return; }
+
+  // --- Low-Pass Filter suhu ---
+  if (isnan(filteredTempPid)) {
+    filteredTempPid = currentTemperatureC; // inisialisasi pertama kali
+  } else {
+    filteredTempPid = (PID_LPF_ALPHA * currentTemperatureC) +
+                      ((1.0f - PID_LPF_ALPHA) * filteredTempPid);
+  }
+
+  // --- Delta time ---
   unsigned long now = millis();
-  double dt = (now - previousPidMs) / 1000.0;
-  if (dt <= 0.0) dt = 0.001;
+  float dt = (now - previousPidMs) / 1000.0f;
+  if (dt <= 0.0f) dt = 0.001f;
   previousPidMs = now;
-  double error  = TEMPERATURE_SETPOINT_C - currentTemperatureC;
-  pidIntegral  += error * dt;
-  pidIntegral   = constrain(pidIntegral, -100.0, 100.0);
-  double derivative = (error - previousError) / dt;
-  previousError     = error;
-  double output = (kp * error) + (ki * pidIntegral) + (kd * derivative);
-  writeHeaterPwm((int)constrain(output, 0.0, (double)PWM_MAX_DUTY));
+
+  // --- Error ---
+  float error = TEMPERATURE_SETPOINT_C - filteredTempPid;
+
+  // --- Integral ---
+  pidIntegral += error * dt;
+
+  // --- Integral decay saat sudah dekat setpoint ---
+  if (fabs(error) < 0.5f) {
+    pidIntegral *= PID_INTEGRAL_DECAY;
+  }
+
+  // --- Anti-windup ---
+  if (pidIntegral >  100.0f) pidIntegral =  100.0f;
+  if (pidIntegral < -100.0f) pidIntegral = -100.0f;
+
+  // --- Derivative ---
+  float derivative = (error - previousError) / dt;
+  previousError    = error;
+
+  // --- PID output + scale ---
+  float pidValue  = (kp * error) + (ki * pidIntegral) + (kd * derivative);
+  float pidOutput = pidValue * PID_SCALE_FACTOR;
+
+  // --- Limit & deadband ---
+  if (pidOutput > 255.0f) pidOutput = 255.0f;
+  if (pidOutput <   0.0f) pidOutput =   0.0f;
+  if (pidOutput < PID_DEADBAND_PWM) pidOutput = 0.0f;
+
+  writeHeaterPwm((int)pidOutput);
+}
+
+// ============================================================
+// FAN
+// ============================================================
+
+void stopFan() {
+  if (fanActive) {
+    fanActive = false;
+    digitalWrite(FAN_PIN, LOW); // relay OFF
+    Serial.println("[Fan] Fan dimatikan.");
+  }
+}
+
+/**
+ * Logika siklus fan berbasis millis (non-blocking).
+ * Hanya aktif saat STATE_DRYING.
+ * Siklus: nyala 10 menit → mati 50 menit → nyala lagi → dst.
+ */
+void updateFan() {
+  // Fan hanya boleh jalan saat pengeringan aktif
+  if (systemState != STATE_DRYING) {
+    stopFan();
+    fanCycleStartMs = 0;
+    return;
+  }
+
+  unsigned long now = millis();
+
+  // Mulai siklus pertama saat baru masuk STATE_DRYING
+  if (fanCycleStartMs == 0) {
+    fanCycleStartMs = now;
+    fanActive       = true;
+    digitalWrite(FAN_PIN, HIGH); // relay ON
+    Serial.println("[Fan] Fan menyala (siklus dimulai).");
+    return;
+  }
+
+  unsigned long elapsed = now - fanCycleStartMs;
+
+  if (fanActive) {
+    // Fan sedang nyala — cek apakah sudah 10 menit
+    if (elapsed >= FAN_ON_DURATION_MS) {
+      fanActive       = false;
+      fanCycleStartMs = now; // mulai hitung waktu mati
+      digitalWrite(FAN_PIN, LOW);
+      Serial.println("[Fan] Fan mati. Menunggu 50 menit sebelum nyala lagi.");
+    }
+  } else {
+    // Fan sedang mati — cek apakah sudah 50 menit
+    if (elapsed >= FAN_OFF_DURATION_MS) {
+      fanActive       = true;
+      fanCycleStartMs = now; // mulai hitung waktu nyala
+      digitalWrite(FAN_PIN, HIGH);
+      Serial.println("[Fan] Fan menyala kembali.");
+    }
+  }
 }
 
 // ============================================================
@@ -823,7 +933,10 @@ void printTelemetry() {
   isnan(currentTemperatureC) ? Serial.print("nan") : Serial.print(currentTemperatureC, 1);
   Serial.print(" C | Kelembapan=");
   isnan(currentHumidity)     ? Serial.print("nan") : Serial.print(currentHumidity, 1);
-  Serial.print(" % | PWM=");   Serial.println(heaterDuty);
+  Serial.print(" % | PWM=");   Serial.print(heaterDuty);
+  Serial.print(" | Suhu LPF=");
+  isnan(filteredTempPid) ? Serial.print("nan") : Serial.print(filteredTempPid, 2);
+  Serial.print(" C | Fan="); Serial.println(fanActive ? "ON" : "OFF");
 }
 
 // ============================================================
@@ -872,6 +985,8 @@ void setup() {
   pinMode(LED_YELLOW_PIN, OUTPUT);
   pinMode(LED_GREEN_PIN,  OUTPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(FAN_PIN, OUTPUT);
+  digitalWrite(FAN_PIN, LOW); // Fan mati saat boot
 
   lastButtonReading  = digitalRead(BUTTON_PIN);
   stableButtonState  = lastButtonReading;
@@ -886,7 +1001,7 @@ void setup() {
   Serial.println();
   Serial.println("=========================================");
   Serial.println(" Sistem Pengering Kopi — CORDY");
-  Serial.println(" PID + Load Cell + ThingSpeak + WiFiManager");
+  Serial.println(" PID + Load Cell + ThingSpeak + WiFiManager + Fan");
   Serial.println("=========================================");
   Serial.println("Field ThingSpeak: 1=berat, 2=suhu, 3=kelembapan, 4=status kopi, 5=status sistem.");
   Serial.println("Serial: t=tare | s=start | i=idle | r=reset WiFi | c=lihat konfigurasi");
@@ -931,6 +1046,7 @@ void loop() {
 
   updateAutomaticState();
   updatePidHeater();
+  updateFan();
   sendThingSpeakIfDue();
 
   if (now - lastSerialPrintMs >= SERIAL_PRINT_INTERVAL_MS) {
